@@ -39,7 +39,13 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+const (
+	unknownDurationSeconds = -1.0
 )
 
 // removeProcessGroups provides a reconciliation step for removing process groups as part of a
@@ -568,6 +574,49 @@ func getProcessesToInclude(
 				}
 			}
 
+			// Tracks the time from when the process was started to be excluded until the process is fully excluded, which
+			// means the process doesn't serve any roles anymore and it is safe to remove it.
+			timeToFullExclusion := unknownDurationSeconds
+			if !processGroup.ExclusionTimestamp.IsZero() {
+				// If the removal timestamp is before the exclusion timestamp, we assume that the operator triggered
+				// the exclusion. The exclusion duration is assumed to be the duration from the fdbv1beta2.ProcessIsMarkedAsExcluded
+				// condition to the ExclusionTimestamp. If fdbv1beta2.ProcessIsMarkedAsExcluded is absent the removal
+				// timestamp will be used. This is a heuristic, as the exclusion might get started at a later point or
+				// eventually will be blocked for some time.
+				if processGroup.RemovalTimestamp.Time.Before(processGroup.ExclusionTimestamp.Time) {
+					// If the fdbv1beta2.ProcessIsMarkedAsExcluded condition is present we use this timestamp, as this
+					// timestamp is set when a process has the `excluded` flag in the cluster status.
+					markedAsExcluded := processGroup.GetConditionTime(
+						fdbv1beta2.ProcessIsMarkedAsExcluded,
+					)
+					if markedAsExcluded != nil {
+						timeToFullExclusion = float64(
+							processGroup.RemovalTimestamp.Time.Unix() - ptr.Deref(
+								markedAsExcluded,
+								0,
+							),
+						)
+					} else {
+						logger.V(1).Info("Missing fdbv1beta2.ProcessIsMarkedAsExcluded")
+						// If the fdbv1beta2.ProcessIsMarkedAsExcluded condition is missing we use the removal timestamp
+						// as the starting time. This is not perfect, but good enough for most cases.
+						timeToFullExclusion = processGroup.ExclusionTimestamp.Sub(processGroup.RemovalTimestamp.Time).
+							Seconds()
+					}
+				}
+
+				processGroup.GetConditionTime(fdbv1beta2.ProcessIsMarkedAsExcluded)
+			}
+
+			logger.Info(
+				"Removing process group from the process group list",
+				"processGroupID",
+				processGroup.ProcessGroupID,
+				"removalDuration",
+				getDurationIfPresent(processGroup.RemovalTimestamp),
+				"timeToFullExclusion",
+				timeToFullExclusion,
+			)
 			if !foundInExcludedServerList && !processGroup.ExclusionSkipped {
 				// This means that the process is marked for exclusion and is also removed in the previous step but is missing
 				// its entry in the excluded servers in the status. This should not throw an error as this will block the
@@ -607,6 +656,16 @@ func processGroupAddressesRemaining(
 		}
 	}
 	return false
+}
+
+// getDurationIfPresent will return the duration of the time since the input time. If the input time is nil
+// or 0 it will return -1.0.
+func getDurationIfPresent(input *metav1.Time) float64 {
+	if !input.IsZero() {
+		return time.Since(input.Time).Seconds()
+	}
+
+	return unknownDurationSeconds
 }
 
 func (r *FoundationDBClusterReconciler) getProcessGroupsToRemove(
@@ -677,6 +736,8 @@ func (r *FoundationDBClusterReconciler) getProcessGroupsToRemove(
 			processGroup.ProcessGroupID,
 			"addresses",
 			processGroup.Addresses,
+			"removalDuration",
+			getDurationIfPresent(processGroup.RemovalTimestamp),
 		)
 		processGroup.SetExclude()
 		processGroupsToRemove = append(processGroupsToRemove, processGroup)
@@ -707,6 +768,14 @@ func (r *FoundationDBClusterReconciler) removeProcessGroups(
 
 	processGroups := append(processGroupsToRemove, terminatingProcessGroups...)
 	for _, processGroup := range processGroups {
+		logger.Info(
+			"Removing resources for process group",
+			"processGroupID",
+			processGroup.ProcessGroupID,
+			"removalDuration",
+			getDurationIfPresent(processGroup.ExclusionTimestamp),
+		)
+
 		err := removeProcessGroup(logr.NewContext(ctx, logger), r, cluster, processGroup)
 		if err != nil {
 			logger.Error(
